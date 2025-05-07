@@ -1,0 +1,54 @@
+name: Go
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: ['1.23', '1.24']
+        include:
+          - go-version: '1.23'
+            allow-failure: false
+          - go-version: '1.24'
+            allow-failure: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          check-latest: true
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Run tests with coverage
+        run: |
+          go test -v -race -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out
+        continue-on-error: ${{ matrix.allow-failure }}
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+         token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Build
+        run: go build -v ./...
+        continue-on-error: ${{ matrix.allow-failure }}
+
+      - name: Run golangci-lint (v2)
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.1.0
+          args: --verbose
+        continue-on-error: ${{ matrix.allow-failure }}

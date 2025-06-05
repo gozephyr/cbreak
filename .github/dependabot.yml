@@ -1,0 +1,30 @@
+version: 2
+updates:
+  # Go modules
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    assignees:
+      - "MitulShah1"
+    labels:
+      - "dependencies"
+      - "go"
+    commit-message:
+       prefix: "chore(deps)"
+       include: "scope"
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    assignees:
+      - "MitulShah1"
+    labels:
+      - "github-actions"
+      - "ci-cd"
+    commit-message:
+       prefix: "chore(deps)"
+       include: "scope"

@@ -15,7 +15,7 @@ func BenchmarkBreakerExecute(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			breaker.Execute(context.Background(), func() (string, error) {
+			_, _ = breaker.Execute(context.Background(), func() (string, error) {
 				return "success", nil
 			})
 		}
@@ -30,7 +30,7 @@ func BenchmarkBreakerExecuteError(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			breaker.Execute(context.Background(), func() (string, error) {
+			_, _ = breaker.Execute(context.Background(), func() (string, error) {
 				return "", ErrTimeout
 			})
 		}
@@ -57,7 +57,7 @@ func BenchmarkBreakerGetMetrics(b *testing.B) {
 
 	// Execute some operations to populate metrics
 	for i := 0; i < 100; i++ {
-		breaker.Execute(context.Background(), func() (string, error) {
+		_, _ = breaker.Execute(context.Background(), func() (string, error) {
 			return "success", nil
 		})
 	}
@@ -84,7 +84,7 @@ func BenchmarkBreakerStateTransitions(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			// Execute operations that will trigger state transitions
-			breaker.Execute(context.Background(), func() (string, error) {
+			_, _ = breaker.Execute(context.Background(), func() (string, error) {
 				return "", ErrTimeout
 			})
 		}
@@ -103,11 +103,11 @@ func BenchmarkBreakerConcurrentMixed(b *testing.B) {
 			counter++
 			if counter%3 == 0 {
 				// Every 3rd operation is an error
-				breaker.Execute(context.Background(), func() (string, error) {
+				_, _ = breaker.Execute(context.Background(), func() (string, error) {
 					return "", ErrTimeout
 				})
 			} else {
-				breaker.Execute(context.Background(), func() (string, error) {
+				_, _ = breaker.Execute(context.Background(), func() (string, error) {
 					return "success", nil
 				})
 			}
@@ -126,7 +126,7 @@ func BenchmarkBreakerWithTimeout(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			breaker.Execute(context.Background(), func() (string, error) {
+			_, _ = breaker.Execute(context.Background(), func() (string, error) {
 				time.Sleep(5 * time.Millisecond)
 				return "success", nil
 			})
@@ -146,7 +146,7 @@ func BenchmarkBreakerHalfOpen(b *testing.B) {
 	defer breaker.Shutdown()
 
 	// Trigger open state
-	breaker.Execute(context.Background(), func() (string, error) {
+	_, _ = breaker.Execute(context.Background(), func() (string, error) {
 		return "", ErrTimeout
 	})
 
@@ -156,7 +156,7 @@ func BenchmarkBreakerHalfOpen(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			breaker.Execute(context.Background(), func() (string, error) {
+			_, _ = breaker.Execute(context.Background(), func() (string, error) {
 				return "success", nil
 			})
 		}
@@ -174,7 +174,7 @@ func BenchmarkBreakerRegistry(b *testing.B) {
 			counter++
 			name := fmt.Sprintf("breaker-%d", counter%10)
 			breaker, _ := registry.GetOrCreate(name, DefaultConfig(name))
-			breaker.Execute(context.Background(), func() (string, error) {
+			_, _ = breaker.Execute(context.Background(), func() (string, error) {
 				return "success", nil
 			})
 		}
@@ -187,7 +187,7 @@ func BenchmarkBreakerMemoryAllocation(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		breaker, _ := NewBreaker[string](DefaultConfig("benchmark"))
-		breaker.Execute(context.Background(), func() (string, error) {
+		_, _ = breaker.Execute(context.Background(), func() (string, error) {
 			return "success", nil
 		})
 		breaker.Shutdown()

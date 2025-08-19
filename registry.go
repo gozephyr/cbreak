@@ -40,7 +40,9 @@ func (r *Registry[T]) GetOrCreate(name string, config *Config) (*Breaker[T], err
 	if err != nil {
 		return nil, err
 	}
+
 	r.breakers[name] = b
+
 	return b, nil
 }
 
@@ -49,6 +51,7 @@ func (r *Registry[T]) GetOrCreate(name string, config *Config) (*Breaker[T], err
 func (r *Registry[T]) Remove(name string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	delete(r.breakers, name)
 }
 
@@ -57,6 +60,7 @@ func (r *Registry[T]) Remove(name string) {
 func (r *Registry[T]) ResetAll() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	for _, b := range r.breakers {
 		b.Reset()
 	}
@@ -67,10 +71,12 @@ func (r *Registry[T]) ResetAll() {
 func (r *Registry[T]) GetStates() map[string]State {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+
 	states := make(map[string]State)
 	for name, b := range r.breakers {
 		states[name] = b.GetState()
 	}
+
 	return states
 }
 
@@ -84,6 +90,7 @@ func (r *Registry[T]) GetMetrics() map[string]*Metrics {
 	for name, breaker := range r.breakers {
 		metrics[name] = breaker.GetMetrics()
 	}
+
 	return metrics
 }
 
@@ -99,6 +106,7 @@ func getDefaultRegistry[T any]() *Registry[T] {
 	// Use a type-specific key to ensure uniqueness
 	key := reflect.TypeOf((*T)(nil)).Elem()
 	value, _ := defaultRegistry.LoadOrStore(key, NewRegistry[T]())
+
 	return value.(*Registry[T])
 }
 

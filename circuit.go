@@ -151,7 +151,7 @@ type Breaker[T any] struct {
 		FailedCalls     int64
 		RejectedCalls   int64
 		TimeoutCalls    int64
-		FailureRate     float64
+		FailureRate     int64 // atomic storage for failure rate (stored as percentage * 100)
 		LastError       error
 		LastErrorTime   int64 // atomic timestamp
 	}
@@ -173,7 +173,8 @@ type Breaker[T any] struct {
 
 // NewBreaker creates a new circuit breaker with the given configuration
 func NewBreaker[T any](config *Config) (*Breaker[T], error) {
-	if err := validateConfig(config); err != nil {
+	err := validateConfig(config)
+	if err != nil {
 		return nil, err
 	}
 
@@ -207,8 +208,10 @@ func (b *Breaker[T]) GetState() State {
 				return newState
 			}
 		}
+
 		return state
 	}
+
 	return Closed
 }
 
@@ -253,6 +256,7 @@ func (b *Breaker[T]) Execute(ctx context.Context, fn func() (T, error)) (T, erro
 			// Too many requests, decrement counter and reject
 			atomic.AddInt32(&b.halfOpenRequests, -1)
 			atomic.AddInt64(&b.metrics.RejectedCalls, 1)
+
 			return zero, ErrCircuitOpen
 		}
 		// Ensure we always decrement the counter after execution
@@ -266,6 +270,7 @@ func (b *Breaker[T]) Execute(ctx context.Context, fn func() (T, error)) (T, erro
 	execCtx := ctx
 	if _, ok := ctx.Deadline(); !ok && b.config.CommandTimeout > 0 {
 		var cancel context.CancelFunc
+
 		execCtx, cancel = context.WithTimeout(ctx, b.config.CommandTimeout)
 		defer cancel()
 	}
@@ -291,6 +296,7 @@ func (b *Breaker[T]) Execute(ctx context.Context, fn func() (T, error)) (T, erro
 	select {
 	case <-execCtx.Done():
 		atomic.AddInt64(&b.metrics.TimeoutCalls, 1)
+
 		err := execCtx.Err()
 		if err == context.Canceled {
 			// Context cancellation should not count as a failure
@@ -299,6 +305,7 @@ func (b *Breaker[T]) Execute(ctx context.Context, fn func() (T, error)) (T, erro
 			// Timeout should count as a failure
 			atomic.AddInt64(&b.metrics.FailedCalls, 1)
 		}
+
 		return zero, err
 	case res := <-resultCh:
 		// Handle result and update metrics
@@ -329,26 +336,31 @@ func (b *Breaker[T]) handleError(err error) {
 
 	// Update error info atomically
 	atomic.StoreInt64(&b.metrics.LastErrorTime, time.Now().UnixNano())
+
+	// Protect LastError field with mutex to avoid race conditions
+	b.mu.Lock()
 	b.metrics.LastError = err
+	b.mu.Unlock()
 
 	// Calculate failure rate with atomic loads to ensure consistency
 	successfulCalls := atomic.LoadInt64(&b.metrics.SuccessfulCalls)
 	failedCalls := atomic.LoadInt64(&b.metrics.FailedCalls)
 	totalCalls := successfulCalls + failedCalls
 
-	var failureRate float64
+	var failureRate int64
 	if totalCalls > 0 {
-		failureRate = float64(failedCalls) / float64(totalCalls) * 100.0
+		failureRate = int64(float64(failedCalls) / float64(totalCalls) * 100.0)
 	}
 
-	// Update metrics
-	b.metrics.FailureRate = failureRate
+	// Update metrics atomically
+	atomic.StoreInt64(&b.metrics.FailureRate, failureRate)
 
 	// Check if we need to transition to Open state
 	currentState := b.GetState()
+
 	failures := atomic.LoadInt64(&b.failures)
-	if b.shouldTransitionToOpen(failures, failureRate, totalCalls, currentState) {
-		b.transitionToOpen(currentState, failures, failureRate)
+	if b.shouldTransitionToOpen(failures, float64(failureRate), totalCalls, currentState) {
+		b.transitionToOpen(currentState, failures, float64(failureRate))
 	}
 }
 
@@ -356,9 +368,11 @@ func (b *Breaker[T]) shouldTransitionToOpen(failures int64, failureRate float64,
 	if currentState == HalfOpen {
 		return true // Any failure in half-open state should transition to open
 	}
+
 	if failures >= int64(b.config.FailureThreshold) && currentState == Closed {
 		return true
 	}
+
 	return failureRate >= b.config.FailureRateThreshold && totalCalls >= 5 && currentState == Closed
 }
 
@@ -379,6 +393,7 @@ func (b *Breaker[T]) transitionToOpen(fromState State, failures int64, failureRa
 
 	// Update state and timestamp
 	now := time.Now()
+
 	b.state.Store(Open)
 	atomic.StoreInt64(&b.lastStateChange, now.UnixNano())
 
@@ -406,13 +421,13 @@ func (b *Breaker[T]) handleSuccess() {
 	failedCalls := atomic.LoadInt64(&b.metrics.FailedCalls)
 	totalCalls := successfulCalls + failedCalls
 
-	var failureRate float64
+	var failureRate int64
 	if totalCalls > 0 {
-		failureRate = float64(failedCalls) / float64(totalCalls) * 100.0
+		failureRate = int64(float64(failedCalls) / float64(totalCalls) * 100.0)
 	}
 
-	// Update metrics
-	b.metrics.FailureRate = failureRate
+	// Update metrics atomically
+	atomic.StoreInt64(&b.metrics.FailureRate, failureRate)
 	currentState := b.GetState()
 
 	// Handle success in HalfOpen state
@@ -440,6 +455,7 @@ func (b *Breaker[T]) transitionToClosed() {
 
 	// Update state and timestamp
 	now := time.Now()
+
 	b.state.Store(Closed)
 	atomic.StoreInt64(&b.lastStateChange, now.UnixNano())
 
@@ -478,6 +494,7 @@ func (b *Breaker[T]) checkAndTransitionToHalfOpen() {
 
 				// Update state and timestamp
 				now := time.Now()
+
 				b.state.Store(HalfOpen)
 				atomic.StoreInt64(&b.lastStateChange, now.UnixNano())
 
@@ -504,15 +521,20 @@ func (b *Breaker[T]) GetMetrics() *Metrics {
 	// Create a copy of metrics to avoid race conditions
 	lastErrorTime := atomic.LoadInt64(&b.metrics.LastErrorTime)
 
+	// Protect LastError field access
+	b.mu.RLock()
+	lastError := b.metrics.LastError
+	b.mu.RUnlock()
+
 	currentMetrics := &Metrics{
 		TotalRequests:   atomic.LoadInt64(&b.metrics.TotalRequests),
 		SuccessfulCalls: atomic.LoadInt64(&b.metrics.SuccessfulCalls),
 		FailedCalls:     atomic.LoadInt64(&b.metrics.FailedCalls),
 		RejectedCalls:   atomic.LoadInt64(&b.metrics.RejectedCalls),
 		TimeoutCalls:    atomic.LoadInt64(&b.metrics.TimeoutCalls),
-		FailureRate:     b.metrics.FailureRate,
+		FailureRate:     float64(atomic.LoadInt64(&b.metrics.FailureRate)),
 		State:           b.GetState(),
-		LastError:       b.metrics.LastError,
+		LastError:       lastError,
 		LastErrorTime:   time.Unix(0, lastErrorTime),
 	}
 
@@ -522,7 +544,9 @@ func (b *Breaker[T]) GetMetrics() *Metrics {
 // Reset resets the circuit breaker to its initial state
 func (b *Breaker[T]) Reset() {
 	b.mu.Lock()
+
 	now := time.Now()
+
 	b.state.Store(Closed)
 	atomic.StoreInt64(&b.lastStateChange, now.UnixNano())
 	b.mu.Unlock()
@@ -538,8 +562,13 @@ func (b *Breaker[T]) Reset() {
 	atomic.StoreInt64(&b.metrics.FailedCalls, 0)
 	atomic.StoreInt64(&b.metrics.RejectedCalls, 0)
 	atomic.StoreInt64(&b.metrics.TimeoutCalls, 0)
-	b.metrics.FailureRate = 0
+	atomic.StoreInt64(&b.metrics.FailureRate, 0)
+
+	// Protect LastError field reset
+	b.mu.Lock()
 	b.metrics.LastError = nil
+	b.mu.Unlock()
+
 	atomic.StoreInt64(&b.metrics.LastErrorTime, now.UnixNano())
 }
 
@@ -593,6 +622,7 @@ func (b *Breaker[T]) ExecuteWithFallback(ctx context.Context, fn func() (T, erro
 	if err != nil {
 		return fallback(err)
 	}
+
 	return result, nil
 }
 
@@ -608,6 +638,7 @@ func (b *Breaker[T]) SetState(state State, reason string) bool {
 
 	// Update state and timestamp
 	now := time.Now()
+
 	b.state.Store(state)
 	atomic.StoreInt64(&b.lastStateChange, now.UnixNano())
 

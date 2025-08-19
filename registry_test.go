@@ -70,7 +70,9 @@ func TestRegistryResetAll(t *testing.T) {
 	// Create circuit and trigger some failures
 	breaker, err := reg.GetOrCreate("test-circuit", config)
 	require.NoError(t, err)
+
 	ctx := context.Background()
+
 	for i := 0; i < config.FailureThreshold; i++ {
 		_, err = breaker.Execute(ctx, func() (string, error) {
 			return "", errRegistryTest
@@ -96,6 +98,7 @@ func TestGetStates(t *testing.T) {
 	// Create circuit and execute an operation
 	breaker, err := reg.GetOrCreate("test-circuit", config)
 	require.NoError(t, err)
+
 	ctx := context.Background()
 	_, err = breaker.Execute(ctx, func() (string, error) {
 		return "test", nil
@@ -117,6 +120,7 @@ func TestGetMetrics(t *testing.T) {
 	// Create circuit and execute some operations
 	breaker, err := reg.GetOrCreate("test-circuit", config)
 	require.NoError(t, err)
+
 	ctx := context.Background()
 
 	// Execute successful operation
@@ -183,6 +187,7 @@ func TestGetMetrics(t *testing.T) {
 
 	// Test metrics after reset
 	breaker2.Reset()
+
 	metrics = reg.GetMetrics()
 	require.Contains(t, metrics, "test-circuit-2")
 	require.Equal(t, Closed, metrics["test-circuit-2"].State)
@@ -199,11 +204,13 @@ func TestConcurrentRegistryOperations(t *testing.T) {
 
 	// Test concurrent GetOrCreate
 	done := make(chan bool)
+
 	for i := 0; i < 100; i++ {
 		go func() {
 			breaker, err := reg.GetOrCreate("test-circuit", config)
 			require.NoError(t, err)
 			require.NotNil(t, breaker)
+
 			done <- true
 		}()
 	}
@@ -269,12 +276,15 @@ func TestRegistryConcurrentAccess(t *testing.T) {
 	defer reg.ResetAll() // Cleanup after test
 
 	var wg sync.WaitGroup
+
 	iterations := 100
+
 	wg.Add(iterations)
 
 	for i := 0; i < iterations; i++ {
 		go func() {
 			defer wg.Done()
+
 			breaker, err := reg.GetOrCreate("test-circuit", nil)
 			require.NoError(t, err)
 			require.NotNil(t, breaker)

@@ -136,26 +136,45 @@ func DefaultConfig(name string) *Config {
 	}
 }
 
-// Breaker is a simplified circuit breaker implementation
+// Breaker is a performance-optimized circuit breaker implementation
 type Breaker[T any] struct {
-	mu      sync.RWMutex
-	state   State
-	config  *Config
-	metrics *Metrics
+	// Atomic state for lock-free reads
+	state atomic.Value // stores State
 
+	// Configuration (immutable after creation)
+	config *Config
+
+	// Metrics with atomic operations
+	metrics struct {
+		TotalRequests   int64
+		SuccessfulCalls int64
+		FailedCalls     int64
+		RejectedCalls   int64
+		TimeoutCalls    int64
+		FailureRate     int64 // atomic storage for failure rate (stored as percentage * 100)
+		LastError       error
+		LastErrorTime   int64 // atomic timestamp
+	}
+
+	// Counters with atomic operations
 	failures         int64
 	successes        int64
-	lastStateChange  time.Time
 	halfOpenRequests int32
 
-	events       []StateChangeEvent
+	// State transition tracking (protected by mu)
+	mu              sync.RWMutex
+	lastStateChange int64 // atomic timestamp
+	events          []StateChangeEvent
+
+	// Shutdown control
 	shutdown     chan struct{}
 	shutdownOnce sync.Once
 }
 
 // NewBreaker creates a new circuit breaker with the given configuration
 func NewBreaker[T any](config *Config) (*Breaker[T], error) {
-	if err := validateConfig(config); err != nil {
+	err := validateConfig(config)
+	if err != nil {
 		return nil, err
 	}
 
@@ -163,22 +182,37 @@ func NewBreaker[T any](config *Config) (*Breaker[T], error) {
 		config = DefaultConfig("default")
 	}
 
-	now := time.Now()
+	now := time.Now().UnixNano()
 	breaker := &Breaker[T]{
-		config:          config,
-		state:           Closed,
-		failures:        0,
-		successes:       0,
-		lastStateChange: now,
-		events:          make([]StateChangeEvent, 0, 10),
-		metrics: &Metrics{
-			State:         Closed,
-			LastErrorTime: now,
-		},
+		config:   config,
+		events:   make([]StateChangeEvent, 0, 10),
 		shutdown: make(chan struct{}),
 	}
 
+	// Initialize atomic state
+	breaker.state.Store(Closed)
+	breaker.lastStateChange = now
+	breaker.metrics.LastErrorTime = now
+
 	return breaker, nil
+}
+
+// GetState returns the current state of the circuit breaker (lock-free)
+func (b *Breaker[T]) GetState() State {
+	if state, ok := b.state.Load().(State); ok {
+		// Check if we need to transition from Open to HalfOpen
+		if state == Open {
+			b.checkAndTransitionToHalfOpen()
+			// Re-read state after potential transition
+			if newState, ok := b.state.Load().(State); ok {
+				return newState
+			}
+		}
+
+		return state
+	}
+
+	return Closed
 }
 
 // Execute executes the given function with circuit breaker protection
@@ -202,8 +236,15 @@ func (b *Breaker[T]) Execute(ctx context.Context, fn func() (T, error)) (T, erro
 	// Increment total requests counter
 	atomic.AddInt64(&b.metrics.TotalRequests, 1)
 
-	// Get current state and handle accordingly
+	// Get current state and handle accordingly (lock-free)
 	state := b.GetState()
+
+	// Check if we need to transition from Open to HalfOpen
+	if state == Open {
+		b.checkAndTransitionToHalfOpen()
+		state = b.GetState() // Re-read state after potential transition
+	}
+
 	switch state {
 	case Open:
 		atomic.AddInt64(&b.metrics.RejectedCalls, 1)
@@ -215,6 +256,7 @@ func (b *Breaker[T]) Execute(ctx context.Context, fn func() (T, error)) (T, erro
 			// Too many requests, decrement counter and reject
 			atomic.AddInt32(&b.halfOpenRequests, -1)
 			atomic.AddInt64(&b.metrics.RejectedCalls, 1)
+
 			return zero, ErrCircuitOpen
 		}
 		// Ensure we always decrement the counter after execution
@@ -228,6 +270,7 @@ func (b *Breaker[T]) Execute(ctx context.Context, fn func() (T, error)) (T, erro
 	execCtx := ctx
 	if _, ok := ctx.Deadline(); !ok && b.config.CommandTimeout > 0 {
 		var cancel context.CancelFunc
+
 		execCtx, cancel = context.WithTimeout(ctx, b.config.CommandTimeout)
 		defer cancel()
 	}
@@ -253,6 +296,7 @@ func (b *Breaker[T]) Execute(ctx context.Context, fn func() (T, error)) (T, erro
 	select {
 	case <-execCtx.Done():
 		atomic.AddInt64(&b.metrics.TimeoutCalls, 1)
+
 		err := execCtx.Err()
 		if err == context.Canceled {
 			// Context cancellation should not count as a failure
@@ -261,6 +305,7 @@ func (b *Breaker[T]) Execute(ctx context.Context, fn func() (T, error)) (T, erro
 			// Timeout should count as a failure
 			atomic.AddInt64(&b.metrics.FailedCalls, 1)
 		}
+
 		return zero, err
 	case res := <-resultCh:
 		// Handle result and update metrics
@@ -289,62 +334,82 @@ func (b *Breaker[T]) handleError(err error) {
 	atomic.AddInt64(&b.metrics.FailedCalls, 1)
 	atomic.AddInt64(&b.failures, 1)
 
+	// Update error info atomically
+	atomic.StoreInt64(&b.metrics.LastErrorTime, time.Now().UnixNano())
+
+	// Protect LastError field with mutex to avoid race conditions
 	b.mu.Lock()
 	b.metrics.LastError = err
-	b.metrics.LastErrorTime = time.Now()
+	b.mu.Unlock()
 
 	// Calculate failure rate with atomic loads to ensure consistency
 	successfulCalls := atomic.LoadInt64(&b.metrics.SuccessfulCalls)
 	failedCalls := atomic.LoadInt64(&b.metrics.FailedCalls)
 	totalCalls := successfulCalls + failedCalls
 
-	var failureRate float64
+	var failureRate int64
 	if totalCalls > 0 {
-		failureRate = float64(failedCalls) / float64(totalCalls) * 100.0
+		failureRate = int64(float64(failedCalls) / float64(totalCalls) * 100.0)
 	}
 
-	// Update metrics
-	b.metrics.FailureRate = failureRate
+	// Update metrics atomically
+	atomic.StoreInt64(&b.metrics.FailureRate, failureRate)
 
 	// Check if we need to transition to Open state
-	currentState := b.state
+	currentState := b.GetState()
+
 	failures := atomic.LoadInt64(&b.failures)
-	if b.shouldTransitionToOpen(failures, failureRate, totalCalls, currentState) {
-		// Reset counters atomically before state transition
-		atomic.StoreInt64(&b.failures, 0)
-		atomic.StoreInt64(&b.successes, 0)
-		atomic.StoreInt32(&b.halfOpenRequests, 0)
-
-		// Update state and timestamp
-		b.state = Open
-		b.lastStateChange = time.Now()
-		b.metrics.State = Open
-
-		// Record state transition
-		event := StateChangeEvent{
-			From:      currentState,
-			To:        Open,
-			Timestamp: b.lastStateChange,
-			Reason:    fmt.Sprintf("threshold exceeded (%d failures, %.2f%% failure rate)", failures, failureRate),
-		}
-		b.events = append(b.events, event)
-
-		// Make callback if it exists
-		if b.config.OnStateChange != nil {
-			b.config.OnStateChange(currentState, Open, fmt.Sprintf("threshold exceeded (%d failures, %.2f%% failure rate)", failures, failureRate))
-		}
+	if b.shouldTransitionToOpen(failures, float64(failureRate), totalCalls, currentState) {
+		b.transitionToOpen(currentState, failures, float64(failureRate))
 	}
-	b.mu.Unlock()
 }
 
 func (b *Breaker[T]) shouldTransitionToOpen(failures int64, failureRate float64, totalCalls int64, currentState State) bool {
 	if currentState == HalfOpen {
 		return true // Any failure in half-open state should transition to open
 	}
+
 	if failures >= int64(b.config.FailureThreshold) && currentState == Closed {
 		return true
 	}
+
 	return failureRate >= b.config.FailureRateThreshold && totalCalls >= 5 && currentState == Closed
+}
+
+func (b *Breaker[T]) transitionToOpen(fromState State, failures int64, failureRate float64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// Double-check state hasn't changed
+	currentState := b.GetState()
+	if currentState != fromState {
+		return
+	}
+
+	// Reset counters atomically before state transition
+	atomic.StoreInt64(&b.failures, 0)
+	atomic.StoreInt64(&b.successes, 0)
+	atomic.StoreInt32(&b.halfOpenRequests, 0)
+
+	// Update state and timestamp
+	now := time.Now()
+
+	b.state.Store(Open)
+	atomic.StoreInt64(&b.lastStateChange, now.UnixNano())
+
+	// Record state transition
+	event := StateChangeEvent{
+		From:      fromState,
+		To:        Open,
+		Timestamp: now,
+		Reason:    fmt.Sprintf("threshold exceeded (%d failures, %.2f%% failure rate)", failures, failureRate),
+	}
+	b.events = append(b.events, event)
+
+	// Make callback if it exists
+	if b.config.OnStateChange != nil {
+		b.config.OnStateChange(fromState, Open, fmt.Sprintf("threshold exceeded (%d failures, %.2f%% failure rate)", failures, failureRate))
+	}
 }
 
 func (b *Breaker[T]) handleSuccess() {
@@ -356,167 +421,121 @@ func (b *Breaker[T]) handleSuccess() {
 	failedCalls := atomic.LoadInt64(&b.metrics.FailedCalls)
 	totalCalls := successfulCalls + failedCalls
 
-	var failureRate float64
+	var failureRate int64
 	if totalCalls > 0 {
-		failureRate = float64(failedCalls) / float64(totalCalls) * 100.0
+		failureRate = int64(float64(failedCalls) / float64(totalCalls) * 100.0)
 	}
 
 	// Update metrics atomically
-	b.mu.Lock()
-	b.metrics.FailureRate = failureRate
-	currentState := b.state
-	b.mu.Unlock()
+	atomic.StoreInt64(&b.metrics.FailureRate, failureRate)
+	currentState := b.GetState()
 
 	// Handle success in HalfOpen state
 	if currentState == HalfOpen {
 		successes := atomic.AddInt64(&b.successes, 1)
 		if successes >= int64(b.config.SuccessThreshold) {
-			b.mu.Lock()
-			// Double check we're still in HalfOpen state
-			if b.state == HalfOpen {
+			b.transitionToClosed()
+		}
+	}
+}
+
+func (b *Breaker[T]) transitionToClosed() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// Double check we're still in HalfOpen state
+	if b.GetState() != HalfOpen {
+		return
+	}
+
+	// Reset counters atomically before state transition
+	atomic.StoreInt64(&b.failures, 0)
+	atomic.StoreInt64(&b.successes, 0)
+	atomic.StoreInt32(&b.halfOpenRequests, 0)
+
+	// Update state and timestamp
+	now := time.Now()
+
+	b.state.Store(Closed)
+	atomic.StoreInt64(&b.lastStateChange, now.UnixNano())
+
+	// Record state transition
+	event := StateChangeEvent{
+		From:      HalfOpen,
+		To:        Closed,
+		Timestamp: now,
+		Reason:    "success threshold reached",
+	}
+	b.events = append(b.events, event)
+
+	// Make callback if it exists
+	if b.config.OnStateChange != nil {
+		b.config.OnStateChange(HalfOpen, Closed, "success threshold reached")
+	}
+}
+
+// checkAndTransitionToHalfOpen checks if we need to transition from Open to HalfOpen
+func (b *Breaker[T]) checkAndTransitionToHalfOpen() {
+	lastChange := atomic.LoadInt64(&b.lastStateChange)
+	timeoutNanos := b.config.Timeout.Nanoseconds()
+	currentTime := time.Now().UnixNano()
+
+	if currentTime-lastChange >= timeoutNanos {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+
+		// Double check the state hasn't changed and timeout still applies
+		if currentState, ok := b.state.Load().(State); ok && currentState == Open {
+			if currentTime-atomic.LoadInt64(&b.lastStateChange) >= timeoutNanos {
 				// Reset counters atomically before state transition
 				atomic.StoreInt64(&b.failures, 0)
 				atomic.StoreInt64(&b.successes, 0)
 				atomic.StoreInt32(&b.halfOpenRequests, 0)
 
 				// Update state and timestamp
-				b.state = Closed
-				b.lastStateChange = time.Now()
-				b.metrics.State = Closed
+				now := time.Now()
+
+				b.state.Store(HalfOpen)
+				atomic.StoreInt64(&b.lastStateChange, now.UnixNano())
 
 				// Record state transition
 				event := StateChangeEvent{
-					From:      HalfOpen,
-					To:        Closed,
-					Timestamp: b.lastStateChange,
-					Reason:    "success threshold reached",
+					From:      Open,
+					To:        HalfOpen,
+					Timestamp: now,
+					Reason:    "timeout elapsed",
 				}
 				b.events = append(b.events, event)
 
 				// Make callback if it exists
 				if b.config.OnStateChange != nil {
-					b.config.OnStateChange(HalfOpen, Closed, "success threshold reached")
+					b.config.OnStateChange(Open, HalfOpen, "timeout elapsed")
 				}
 			}
-			b.mu.Unlock()
 		}
 	}
-}
-
-// GetState returns the current state of the circuit breaker
-func (b *Breaker[T]) GetState() State {
-	// First try with a read lock
-	b.mu.RLock()
-	state := b.state
-	lastChange := b.lastStateChange
-	b.mu.RUnlock()
-
-	// Check if we need to transition to HalfOpen
-	if state == Open && time.Since(lastChange) >= b.config.Timeout {
-		// Upgrade to write lock for state transition
-		b.mu.Lock()
-		// Double check the state hasn't changed
-		if b.state == Open && time.Since(b.lastStateChange) >= b.config.Timeout {
-			// Reset counters atomically before state transition
-			atomic.StoreInt64(&b.failures, 0)
-			atomic.StoreInt64(&b.successes, 0)
-			atomic.StoreInt32(&b.halfOpenRequests, 0)
-
-			// Update state and timestamp
-			b.state = HalfOpen
-			b.lastStateChange = time.Now()
-			b.metrics.State = HalfOpen
-
-			// Record state transition
-			event := StateChangeEvent{
-				From:      Open,
-				To:        HalfOpen,
-				Timestamp: b.lastStateChange,
-				Reason:    "timeout elapsed",
-			}
-			b.events = append(b.events, event)
-
-			// Make callback if it exists
-			if b.config.OnStateChange != nil {
-				b.config.OnStateChange(Open, HalfOpen, "timeout elapsed")
-			}
-			state = HalfOpen
-		}
-		b.mu.Unlock()
-	}
-
-	return state
-}
-
-// transitionState transitions the circuit breaker from one state to another
-func (b *Breaker[T]) transitionState(from, to State, reason string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	// Only transition if we're still in the 'from' state
-	if b.state != from {
-		return
-	}
-
-	// Update state and timestamp
-	b.state = to
-	b.lastStateChange = time.Now()
-	b.metrics.State = to
-
-	// Record state transition
-	event := StateChangeEvent{
-		From:      from,
-		To:        to,
-		Timestamp: b.lastStateChange,
-		Reason:    reason,
-	}
-	b.events = append(b.events, event)
-
-	// Reset counters based on state transition
-	switch to {
-	case HalfOpen:
-		atomic.StoreInt64(&b.failures, 0)
-		atomic.StoreInt64(&b.successes, 0)
-		atomic.StoreInt32(&b.halfOpenRequests, 0)
-	case Closed:
-		atomic.StoreInt64(&b.failures, 0)
-		atomic.StoreInt64(&b.successes, 0)
-		atomic.StoreInt32(&b.halfOpenRequests, 0)
-	}
-
-	// Make callback if it exists
-	if b.config.OnStateChange != nil {
-		b.config.OnStateChange(from, to, reason)
-	}
-}
-
-// SetState manually sets the circuit breaker state
-func (b *Breaker[T]) SetState(state State, reason string) bool {
-	b.mu.RLock()
-	oldState := b.state
-	b.mu.RUnlock()
-
-	if oldState == state {
-		return false
-	}
-
-	b.transitionState(oldState, state, reason)
-	return true
 }
 
 // GetMetrics returns the current metrics of the circuit breaker
 func (b *Breaker[T]) GetMetrics() *Metrics {
 	// Create a copy of metrics to avoid race conditions
+	lastErrorTime := atomic.LoadInt64(&b.metrics.LastErrorTime)
+
+	// Protect LastError field access
+	b.mu.RLock()
+	lastError := b.metrics.LastError
+	b.mu.RUnlock()
+
 	currentMetrics := &Metrics{
 		TotalRequests:   atomic.LoadInt64(&b.metrics.TotalRequests),
 		SuccessfulCalls: atomic.LoadInt64(&b.metrics.SuccessfulCalls),
 		FailedCalls:     atomic.LoadInt64(&b.metrics.FailedCalls),
 		RejectedCalls:   atomic.LoadInt64(&b.metrics.RejectedCalls),
 		TimeoutCalls:    atomic.LoadInt64(&b.metrics.TimeoutCalls),
-		FailureRate:     b.metrics.FailureRate,
+		FailureRate:     float64(atomic.LoadInt64(&b.metrics.FailureRate)),
 		State:           b.GetState(),
-		LastError:       b.metrics.LastError,
-		LastErrorTime:   b.metrics.LastErrorTime,
+		LastError:       lastError,
+		LastErrorTime:   time.Unix(0, lastErrorTime),
 	}
 
 	return currentMetrics
@@ -525,8 +544,11 @@ func (b *Breaker[T]) GetMetrics() *Metrics {
 // Reset resets the circuit breaker to its initial state
 func (b *Breaker[T]) Reset() {
 	b.mu.Lock()
-	b.state = Closed
-	b.lastStateChange = time.Now()
+
+	now := time.Now()
+
+	b.state.Store(Closed)
+	atomic.StoreInt64(&b.lastStateChange, now.UnixNano())
 	b.mu.Unlock()
 
 	// Reset counters atomically
@@ -535,7 +557,19 @@ func (b *Breaker[T]) Reset() {
 	atomic.StoreInt32(&b.halfOpenRequests, 0)
 
 	// Reset metrics
-	b.metrics = &Metrics{State: Closed}
+	atomic.StoreInt64(&b.metrics.TotalRequests, 0)
+	atomic.StoreInt64(&b.metrics.SuccessfulCalls, 0)
+	atomic.StoreInt64(&b.metrics.FailedCalls, 0)
+	atomic.StoreInt64(&b.metrics.RejectedCalls, 0)
+	atomic.StoreInt64(&b.metrics.TimeoutCalls, 0)
+	atomic.StoreInt64(&b.metrics.FailureRate, 0)
+
+	// Protect LastError field reset
+	b.mu.Lock()
+	b.metrics.LastError = nil
+	b.mu.Unlock()
+
+	atomic.StoreInt64(&b.metrics.LastErrorTime, now.UnixNano())
 }
 
 // Shutdown cleanly shuts down the circuit breaker
@@ -588,5 +622,47 @@ func (b *Breaker[T]) ExecuteWithFallback(ctx context.Context, fn func() (T, erro
 	if err != nil {
 		return fallback(err)
 	}
+
 	return result, nil
+}
+
+// SetState manually sets the circuit breaker state
+func (b *Breaker[T]) SetState(state State, reason string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	oldState := b.GetState()
+	if oldState == state {
+		return false
+	}
+
+	// Update state and timestamp
+	now := time.Now()
+
+	b.state.Store(state)
+	atomic.StoreInt64(&b.lastStateChange, now.UnixNano())
+
+	// Record state transition
+	event := StateChangeEvent{
+		From:      oldState,
+		To:        state,
+		Timestamp: now,
+		Reason:    reason,
+	}
+	b.events = append(b.events, event)
+
+	// Reset counters based on state transition
+	switch state {
+	case HalfOpen, Closed:
+		atomic.StoreInt64(&b.failures, 0)
+		atomic.StoreInt64(&b.successes, 0)
+		atomic.StoreInt32(&b.halfOpenRequests, 0)
+	}
+
+	// Make callback if it exists
+	if b.config.OnStateChange != nil {
+		b.config.OnStateChange(oldState, state, reason)
+	}
+
+	return true
 }

@@ -61,6 +61,7 @@ func TestCircuitStateTransitions(t *testing.T) {
 		})
 		require.ErrorIs(t, err, expectedErr)
 	}
+
 	require.Equal(t, Open, breaker.GetState())
 
 	// Test Open -> HalfOpen transition
@@ -76,6 +77,7 @@ func TestCircuitStateTransitions(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, "success", result)
 	}
+
 	require.Eventually(t, func() bool {
 		return breaker.GetState() == Closed
 	}, 200*time.Millisecond, 10*time.Millisecond)
@@ -97,18 +99,23 @@ func TestConcurrentOperations(t *testing.T) {
 	require.NoError(t, err)
 
 	var wg sync.WaitGroup
+
 	var successCount, failureCount atomic.Int64
+
 	ctx := context.Background()
 
 	// Launch concurrent operations
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
+
 		go func(i int) {
 			defer wg.Done()
+
 			result, err := breaker.Execute(ctx, func() (string, error) {
 				if i%2 == 0 {
 					return "success", nil
 				}
+
 				return "", errors.New("test error")
 			})
 			if err == nil {
@@ -122,6 +129,7 @@ func TestConcurrentOperations(t *testing.T) {
 
 	wg.Wait()
 	time.Sleep(100 * time.Millisecond) // Wait for metrics to update
+
 	metrics := breaker.GetMetrics()
 	require.Equal(t, int64(5), metrics.SuccessfulCalls)
 	require.Equal(t, int64(5), metrics.FailedCalls)
@@ -180,6 +188,7 @@ func TestFallback(t *testing.T) {
 func ExampleNewBreaker() {
 	config := DefaultConfig("example")
 	breaker, _ := NewBreaker[string](config)
+
 	result, err := breaker.Execute(context.Background(), func() (string, error) {
 		return "success", nil
 	})
@@ -192,6 +201,7 @@ func ExampleNewBreaker() {
 func ExampleBreaker_ExecuteWithFallback() {
 	config := DefaultConfig("example")
 	breaker, _ := NewBreaker[string](config)
+
 	result, err := breaker.ExecuteWithFallback(context.Background(),
 		func() (string, error) {
 			return "", errors.New("primary error")
@@ -208,6 +218,7 @@ func ExampleBreaker_ExecuteWithFallback() {
 // ExampleGet demonstrates how to use the default registry
 func ExampleGet() {
 	breaker, _ := Get[string]("example")
+
 	result, err := breaker.Execute(context.Background(), func() (string, error) {
 		return "success", nil
 	})
@@ -410,10 +421,12 @@ func TestExecuteErrorPaths(t *testing.T) {
 
 	// Test context cancellation
 	cancelCtx, cancel := context.WithCancel(ctx)
+
 	go func() {
 		time.Sleep(10 * time.Millisecond)
 		cancel()
 	}()
+
 	_, err = breaker.Execute(cancelCtx, func() (string, error) {
 		time.Sleep(100 * time.Millisecond)
 		return "success", nil
@@ -471,6 +484,7 @@ func TestExecuteEdgeCases(t *testing.T) {
 	// Test with cancelled context
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
+
 	_, err = breaker.Execute(ctx, func() (string, error) {
 		return "test", nil
 	})
@@ -480,7 +494,9 @@ func TestExecuteEdgeCases(t *testing.T) {
 	// Test with deadline exceeded
 	ctx, cancel = context.WithTimeout(context.Background(), 1*time.Nanosecond)
 	defer cancel()
+
 	time.Sleep(1 * time.Millisecond)
+
 	_, err = breaker.Execute(ctx, func() (string, error) {
 		return "test", nil
 	})

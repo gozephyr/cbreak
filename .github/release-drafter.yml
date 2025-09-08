@@ -1,0 +1,98 @@
+name-template: 'v$RESOLVED_VERSION 🌟'
+tag-template: 'v$RESOLVED_VERSION'
+categories:
+  - title: '🚀 Features'
+    labels:
+      - 'feature'
+      - 'enhancement'
+  - title: '🐛 Bug Fixes'
+    labels:
+      - 'fix'
+      - 'bugfix'
+      - 'bug'
+  - title: '🧰 Maintenance'
+    labels:
+      - 'chore'
+      - 'dependencies'
+      - 'maintenance'
+  - title: '📚 Documentation'
+    labels:
+      - 'documentation'
+      - 'docs'
+  - title: '⚡ Performance'
+    labels:
+      - 'performance'
+      - 'optimization'
+  - title: '🧪 Testing'
+    labels:
+      - 'test'
+      - 'testing'
+  - title: '🔧 Configuration'
+    labels:
+      - 'config'
+      - 'ci'
+      - 'cd'
+
+change-template: '- $TITLE @$AUTHOR (#$NUMBER)'
+
+change-title-escapes: '\<*_&' # You can add # and @ to disable mentions, and add ` to disable code blocks.
+
+version-resolver:
+  major:
+    labels:
+      - 'major'
+      - 'breaking'
+  minor:
+    labels:
+      - 'minor'
+      - 'feature'
+      - 'enhancement'
+  patch:
+    labels:
+      - 'patch'
+      - 'fix'
+      - 'bugfix'
+      - 'bug'
+      - 'chore'
+      - 'dependencies'
+      - 'maintenance'
+      - 'documentation'
+      - 'docs'
+      - 'performance'
+      - 'optimization'
+      - 'test'
+      - 'testing'
+      - 'config'
+      - 'ci'
+      - 'cd'
+
+template: |
+  ## 🎉 What's Changed
+
+  $CHANGES
+
+  ## 📊 Performance Improvements
+
+  This release includes significant performance optimizations:
+
+  - **Zero-allocation execution** by default for high performance
+  - **Removed CommandTimeout** field and related timeout handling
+  - **Enhanced test coverage** from 92.4% to 95.2%
+  - **Comprehensive benchmark suite** with external repository integration
+
+  ## 🧪 Testing & Quality
+
+  - Added extensive test cases for better reliability
+  - Improved code coverage with comprehensive test scenarios
+  - Enhanced concurrency and stress testing
+  - Fixed linting issues and improved code quality
+
+  ## 📈 Benchmarks
+
+  For detailed performance comparisons, see our dedicated benchmark repository: **[Circuit Breaker Benchmark](https://github.com/gozephyr/circuit-breaker-benchmark)**
+
+  ## 🔗 Full Changelog
+
+  $CHANGES
+
+  **Full Changelog**: https://github.com/gozephyr/cbreak/compare/$PREVIOUS_TAG...v$RESOLVED_VERSION

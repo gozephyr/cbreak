@@ -35,6 +35,7 @@ var (
 	ErrTimeout       = errors.New("operation timed out")
 	ErrNilFunction   = errors.New("nil function")
 	ErrInvalidConfig = errors.New("invalid configuration")
+	ErrPanic         = errors.New("panic in execution")
 )
 
 // State represents the state of a circuit breaker
@@ -100,8 +101,6 @@ type Config struct {
 	// Timeouts control operation timing
 	// Timeout is the duration before the circuit breaker resets from open to half-open
 	Timeout time.Duration
-	// CommandTimeout is the maximum duration for each operation
-	CommandTimeout time.Duration
 
 	// HalfOpenMaxRequests limits concurrent requests during half-open state
 	HalfOpenMaxRequests int
@@ -130,7 +129,6 @@ func DefaultConfig(name string) *Config {
 		SuccessThreshold:     3,
 		FailureRateThreshold: 50.0,
 		Timeout:              30 * time.Second,
-		CommandTimeout:       10 * time.Second,
 		HalfOpenMaxRequests:  5,
 		ErrorClassifier:      func(err error) bool { return err != nil },
 	}
@@ -226,11 +224,13 @@ func (b *Breaker[T]) Execute(ctx context.Context, fn func() (T, error)) (T, erro
 	}
 
 	// Check if circuit breaker is shutting down
-	select {
-	case <-b.shutdown:
-		atomic.AddInt64(&b.metrics.RejectedCalls, 1)
-		return zero, ErrCircuitOpen
-	default:
+	if b.shutdown != nil {
+		select {
+		case <-b.shutdown:
+			atomic.AddInt64(&b.metrics.RejectedCalls, 1)
+			return zero, ErrCircuitOpen
+		default:
+		}
 	}
 
 	// Increment total requests counter
@@ -263,55 +263,25 @@ func (b *Breaker[T]) Execute(ctx context.Context, fn func() (T, error)) (T, erro
 		defer atomic.AddInt32(&b.halfOpenRequests, -1)
 	}
 
-	// Execute with timeout
-	resultCh := make(chan Result[T], 1)
+	// Execute synchronously for zero allocations
+	var result T
+	var err error
 
-	// Add a timeout if not already present in the context
-	execCtx := ctx
-	if _, ok := ctx.Deadline(); !ok && b.config.CommandTimeout > 0 {
-		var cancel context.CancelFunc
-
-		execCtx, cancel = context.WithTimeout(ctx, b.config.CommandTimeout)
-		defer cancel()
-	}
-
-	// Execute in goroutine to handle panics and timeouts
-	go func() {
+	// Execute the function with panic recovery
+	func() {
 		defer func() {
 			if r := recover(); r != nil {
-				resultCh <- Result[T]{
-					Err: fmt.Errorf("panic in execution: %v", r),
-				}
+				// Use predefined error instead of fmt.Errorf
+				b.handleResult(ErrPanic)
+				err = ErrPanic
 			}
 		}()
-
-		result, err := fn()
-		resultCh <- Result[T]{
-			Value: result,
-			Err:   err,
-		}
+		result, err = fn()
 	}()
 
-	// Wait for result or timeout
-	select {
-	case <-execCtx.Done():
-		atomic.AddInt64(&b.metrics.TimeoutCalls, 1)
-
-		err := execCtx.Err()
-		if err == context.Canceled {
-			// Context cancellation should not count as a failure
-			atomic.AddInt64(&b.metrics.SuccessfulCalls, 1)
-		} else {
-			// Timeout should count as a failure
-			atomic.AddInt64(&b.metrics.FailedCalls, 1)
-		}
-
-		return zero, err
-	case res := <-resultCh:
-		// Handle result and update metrics
-		b.handleResult(res.Err)
-		return res.Value, res.Err
-	}
+	// Handle result and update metrics
+	b.handleResult(err)
+	return result, err
 }
 
 // handleResult processes the result of an operation and updates metrics
@@ -603,10 +573,6 @@ func validateConfig(config *Config) error {
 
 	if config.Timeout <= 0 {
 		return errors.New("invalid timeout")
-	}
-
-	if config.CommandTimeout <= 0 {
-		return errors.New("invalid command timeout")
 	}
 
 	if config.HalfOpenMaxRequests <= 0 {

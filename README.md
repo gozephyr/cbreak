@@ -217,6 +217,14 @@ case cbreak.HalfOpen:
 }
 ```
 
+## Benchmarks
+
+### Comprehensive Benchmark Suite
+
+For detailed performance comparisons and benchmarks, see our dedicated benchmark repository: **[Circuit Breaker Benchmark](https://github.com/gozephyr/circuit-breaker-benchmark)**
+
+The benchmark suite compares `gozephyr/cbreak` against other popular circuit breaker implementations including `sony/gobreaker`.
+
 ## Best Practices
 
 1. Always close the circuit breaker when done:

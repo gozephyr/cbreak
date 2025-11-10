@@ -47,7 +47,7 @@ jobs:
         continue-on-error: ${{ matrix.allow-failure }}
 
       - name: Run golangci-lint (v2)
-        uses: golangci/golangci-lint-action@v8
+        uses: golangci/golangci-lint-action@v9
         with:
           version: v2.1.0
           args: --verbose
